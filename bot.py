@@ -1,64 +1,51 @@
 import os
-import openai
-from flask import Flask, request
-from telegram import Update, Bot
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-    Dispatcher,
-)
+import logging
+import aiohttp
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import Message
+from aiogram.utils import executor
+from aiohttp import ClientSession
 
-# Получаем ключи
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # например, https://your-app.onrender.com/webhook
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+HF_TOKEN = os.getenv("HF_TOKEN")
 
-# Инициализация
-openai.api_key = OPENAI_API_KEY
-app = Flask(__name__)
-bot = Bot(BOT_TOKEN)
+logging.basicConfig(level=logging.INFO)
 
-# Telegram app с Dispatcher
-telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+dp = Dispatcher(bot)
 
-# Команды
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Напиши описание, и я сгенерирую изображение по нему 🎨")
+API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-2"
 
-async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prompt = update.message.text
-    await update.message.reply_text("Создаю изображение... ⏳")
+headers = {
+    "Authorization": f"Bearer {HF_TOKEN}"
+}
+
+
+async def generate_image(prompt: str) -> bytes:
+    async with aiohttp.ClientSession() as session:
+        async with session.post(API_URL, headers=headers, json={"inputs": prompt}) as response:
+            if response.status != 200:
+                text = await response.text()
+                raise Exception(f"Error from HuggingFace API: {text}")
+            return await response.read()
+
+
+@dp.message_handler(commands=["start"])
+async def handle_start(message: Message):
+    await message.reply("Привет! Отправь мне описание, и я сгенерирую изображение.")
+
+
+@dp.message_handler()
+async def handle_prompt(message: Message):
+    prompt = message.text.strip()
+    await message.reply("Генерирую изображение, подожди немного...")
 
     try:
-        response = openai.images.generate(
-            prompt=prompt,
-            n=1,
-            size="1024x1024"
-        )
-        image_url = response.data[0].url
-        await update.message.reply_photo(photo=image_url, caption="Готово! 😊")
+        image_bytes = await generate_image(prompt)
+        await bot.send_photo(message.chat.id, photo=image_bytes, caption="Вот твоё изображение!")
     except Exception as e:
-        await update.message.reply_text(f"Ошибка при создании изображения: {e}")
+        await message.reply(f"Произошла ошибка при генерации изображения:\n{e}")
 
-# Обработчики
-telegram_app.add_handler(CommandHandler("start", start))
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_prompt))
 
-# Flask Webhook endpoint
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
-    telegram_app.update_queue.put_nowait(update)
-    return "ok"
-
-# Установка Webhook при запуске
-@app.before_first_request
-def set_webhook():
-    bot.delete_webhook()
-    bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True)
